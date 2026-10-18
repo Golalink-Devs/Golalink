@@ -1,8 +1,9 @@
 name: nightly
 
 on:
-  schedule:
-    - cron: "0 3 * * *"
+  # schedule:
+  #   - cron: "0 3 * * *"
+  # I'll enable it in the future 
   workflow_dispatch:
 
 permissions:
