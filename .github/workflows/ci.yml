@@ -1,0 +1,57 @@
+name: ci
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: format, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      # Tests that compare against FFmpeg, or that need a fixture on disk, skip
+      # themselves unless the matching environment variable is set. They are run
+      # by hand rather than here, because they need a media file to work on.
+      - run: go test ./...
+
+  targets:
+    name: every release target compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The release builds this list, so it is compiled on every change rather
+      # than discovered to be broken when a tag is pushed. One runner is enough
+      # because this only compiles.
+      - name: build every target
+        run: |
+          set -euo pipefail
+          targets="windows/386 windows/amd64 windows/arm64
+                   linux/386 linux/amd64 linux/arm linux/arm64 linux/loong64
+                   linux/mips linux/mipsle linux/mips64 linux/mips64le
+                   linux/ppc64 linux/ppc64le linux/riscv64 linux/s390x
+                   darwin/amd64 darwin/arm64"
+          for t in $targets; do
+            export GOOS="${t%/*}" GOARCH="${t#*/}"
+            if [ "$GOARCH" = arm ]; then
+              for v in 6 7; do
+                echo "building $GOOS/$GOARCH v$v"
+                GOARM="$v" CGO_ENABLED=0 go build ./...
+              done
+            else
+              echo "building $GOOS/$GOARCH"
+              CGO_ENABLED=0 go build ./...
+            fi
+          done

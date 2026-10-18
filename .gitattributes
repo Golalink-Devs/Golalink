@@ -1,0 +1,7 @@
+# The repository stores LF so the Linux CI and every contributor see the same
+# bytes; Windows checkouts still get CRLF for PowerShell scripts.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.exe binary
+*.png binary

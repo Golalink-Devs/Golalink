@@ -1,0 +1,79 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: nightly-${{ github.run_number }}
+      retention: 14
+
+  release:
+    name: publish nightly
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # The nightly release is reused rather than recreated, so the tag and the
+      # link people bookmark keep working. Its assets are replaced in place.
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view nightly >/dev/null 2>&1; then
+            gh release create nightly \
+              --prerelease \
+              --title "Nightly" \
+              --notes "Built from the latest commit on the default branch. These are not releases: use a tagged version for anything you depend on."
+          fi
+          gh release upload nightly dist/* --clobber
+          gh release edit nightly --title "Nightly $(date -u +%Y-%m-%d)"
+
+  docker:
+    name: publish nightly image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: lower case image name
+        id: image
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=nightly
+            type=raw,value=nightly-{{date 'YYYYMMDD'}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The same four platforms the release publishes: node:22-bookworm-slim
+          # has no 386 and none of the Dockerfile's base images has s390x, so a
+          # longer list fails the build rather than covering more machines.
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=nightly-${{ github.run_number }}

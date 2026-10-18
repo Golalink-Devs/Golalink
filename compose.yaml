@@ -1,0 +1,32 @@
+services:
+  golalink:
+    # Build from this checkout, or use the published multi-architecture image by
+    # commenting the build line and uncommenting the image one.
+    build: .
+    # image: ghcr.io/golalink/golalink:latest
+    init: true
+    ports:
+      - "127.0.0.1:2333:2333"
+    environment:
+      GOLALINK_PASSWORD: ${GOLALINK_PASSWORD:?set GOLALINK_PASSWORD}
+      # Docker already collects stdout, so no log files are written.
+      GOLALINK_LOG_DIRECTORY: ""
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      SPOTIFY_REFRESH_TOKEN: ${SPOTIFY_REFRESH_TOKEN:-}
+      SPOTIFY_MARKET: ${SPOTIFY_MARKET:-US}
+    volumes:
+      # Keeps the yt-dlp download across restarts.
+      - tools:/app/.tools
+    restart: unless-stopped
+    stop_grace_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  tools:

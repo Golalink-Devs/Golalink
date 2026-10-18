@@ -1,0 +1,10 @@
+/.tools/
+/bin/
+/logs/
+/config.yaml
+/config.yml
+/config.json
+/.env
+/coverage
+/coverage.out
+/.probe-next/

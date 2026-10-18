@@ -1,0 +1,104 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version stamped into the binaries
+        required: true
+        type: string
+      retention:
+        description: Days to keep the artifacts
+        required: false
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            archive: zip
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: package
+        id: package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE: ${{ matrix.archive }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          name="golalink_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${name}"
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X golalink/internal/server.Version=${VERSION}" \
+            -o "dist/${name}/golalink${EXT}" ./cmd/golalink
+          cp LICENSE README.md "dist/${name}/"
+          if [ "${ARCHIVE}" = zip ]; then
+            (cd dist && zip -qr "${name}.zip" "${name}")
+          else
+            tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          fi
+          rm -rf "dist/${name}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          retention-days: ${{ inputs.retention }}
+          if-no-files-found: error
+
+  checksums:
+    name: checksums
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: write checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./* > checksums.txt
+          cat checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/checksums.txt
+          retention-days: ${{ inputs.retention }}

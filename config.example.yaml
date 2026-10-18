@@ -1,0 +1,82 @@
+# --- Node ---
+address: 127.0.0.1:2333                    # listen address
+password: ""                               # node password
+
+# --- Media tools ---
+ffmpeg: ffmpeg                              # ffmpeg executable, a path, or none
+toolsDirectory: .tools                     # helper directory
+autoDownload: false                         # download a missing helper at startup
+inProcessAudio: true                       # decode in process instead of with ffmpeg
+lyricsSource: lrclib                       # lyrics: lrclib, then YouTube Music, or none
+
+# --- Logging ---
+logLevel: info                             # log level
+logFormat: text                            # log format
+logColor: auto                             # colour mode
+logDirectory: logs                         # daily log file directory
+
+# --- yt-dlp ---
+ytDlpEnabled: true                         # yt-dlp fallback
+ytDlp: yt-dlp                              # yt-dlp executable
+
+# --- YouTube ---
+youtubeNative: true                        # native InnerTube client
+youtubeEndpoint: https://youtubei.googleapis.com
+youtubeMusicEndpoint: https://music.youtube.com
+youtubeClientVersion: ""
+
+# --- SoundCloud ---
+soundcloudNative: true                     # native public API client
+soundcloudApiEndpoint: https://api-v2.soundcloud.com
+soundcloudWebEndpoint: https://soundcloud.com
+soundcloudClientId: ""                     # empty scrapes and caches one
+soundcloudClientIdTtlSeconds: 21600
+
+# --- Spotify ---
+spotifyClientId: ""                        # Spotify application client id
+spotifyClientSecret: ""                    # Spotify application client secret
+spotifyRefreshToken: ""                    # user authorisation refresh token
+spotifyMarket: US                          # market country code
+
+# --- Deezer ---
+deezerApiEndpoint: https://api.deezer.com
+
+# --- Filters ---
+filters:
+  volume: true
+  equalizer: true
+  karaoke: true
+  timescale: true
+  tremolo: true
+  vibrato: true
+  distortion: true
+  rotation: true
+  channelMix: true
+  lowPass: true
+
+# --- Capacity ---
+maxPlayers: 100
+maxSessions: 100
+maxConcurrentLoads: 8
+maxPlaylistTracks: 100
+searchResults: 5
+cacheEntries: 1024
+cacheTtlSeconds: 300
+loadTimeoutSeconds: 30
+playerUpdateSeconds: 5
+statsSeconds: 60
+eventBuffer: 256
+opusBitrate: 128000                        # Opus bitrate in bit/s
+
+# --- Ratelimits ---
+ratelimits:
+  enable: true                             # enable per-route request throttling
+
+# --- Webhook ---
+webhook:
+  enable: false                            # post node events to an external endpoint
+  url: ""                                  # webhook URL; a Discord URL receives an embed
+  stateLatencySeconds: 5                   # latency between whole-node player state reports; 0 disables
+
+# --- Security ---
+allowPrivateNetworks: false                # allow private network sources

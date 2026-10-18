@@ -1,0 +1,14 @@
+.git
+.github
+.tools
+bin
+logs
+coverage
+coverage.out
+config.yaml
+config.yml
+config.json
+.env
+docs
+README.md
+LICENSE
