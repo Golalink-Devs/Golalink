@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golalink/internal/config"
@@ -26,12 +25,14 @@ type Frames interface {
 	Close() error
 }
 type Engine interface {
+	// The context remains live for the whole playback. Canceling it must
+	// interrupt both startup and any blocked call to Frames.Next.
 	Start(context.Context, *protocol.Track, int64, int, protocol.Object) (Frames, error)
 }
 type FFmpeg struct {
 	Config config.Config
 	Source Source
-	// Logger receives the decoder lifecycle: process start, exit and stalls.
+	// Logger receives the decoder lifecycle: process start and exit.
 	// Nil falls back to the default logger.
 	Logger *slog.Logger
 }
@@ -46,7 +47,7 @@ func (e *FFmpeg) log() *slog.Logger {
 
 const StuckThreshold = 10 * time.Second
 
-var ErrStuck = errors.New("audio decoder produced no complete frame for 10 seconds")
+var ErrStuck = errors.New("audio engine did not start or produce a complete frame within 10 seconds")
 
 // ErrFFmpegMissing is returned for a track that needs FFmpeg when none is
 // installed. The in-process pipeline takes the common formats, so a node without
@@ -115,21 +116,8 @@ func (e *FFmpeg) StartBody(ctx context.Context, t *protocol.Track, body io.ReadC
 		"volume", volume,
 		"opusBitrate", e.Config.OpusBitrate,
 	)
-	s := &stream{cmd: cmd, reader: NewOggReader(stdout), body: body, stdout: stdout, cancel: cancel, stderr: stderr,
-		logger: e.log(), identifier: t.Info.Identifier, started: time.Now()}
-	s.stallTimer = time.AfterFunc(StuckThreshold, func() {
-		s.stalled.Store(true)
-		s.logger.Warn("ffmpeg stalled; no complete frame within the threshold",
-			"pid", s.pid(),
-			"identifier", s.identifier,
-			"thresholdSeconds", int(StuckThreshold/time.Second),
-		)
-		cancel()
-		body.Close()
-		stdout.Close()
-	})
-	s.stallTimer.Stop()
-	return s, nil
+	return &stream{cmd: cmd, reader: NewOggReader(stdout), body: body, stdout: stdout, cancel: cancel, stderr: stderr,
+		logger: e.log(), identifier: t.Info.Identifier, started: time.Now()}, nil
 }
 
 // pid reports the decoder process id, or 0 once it is gone.
@@ -175,20 +163,13 @@ type stream struct {
 	stderr     *process.Buffer
 	once       sync.Once
 	err        error
-	stallTimer *time.Timer
-	stalled    atomic.Bool
 	logger     *slog.Logger
 	identifier string
 	started    time.Time
 }
 
 func (s *stream) Next() ([]byte, error) {
-	s.stallTimer.Reset(StuckThreshold)
 	b, e := s.reader.Next()
-	s.stallTimer.Stop()
-	if s.stalled.Load() {
-		return nil, ErrStuck
-	}
 	if e == io.EOF {
 		s.once.Do(func() {
 			s.body.Close()
@@ -203,7 +184,6 @@ func (s *stream) Next() ([]byte, error) {
 	return b, e
 }
 func (s *stream) Close() error {
-	s.stallTimer.Stop()
 	s.once.Do(func() {
 		s.cancel()
 		s.body.Close()

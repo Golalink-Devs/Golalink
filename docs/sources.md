@@ -175,10 +175,15 @@ the range and returns the whole stream, the already-delivered prefix is discarde
 the bytes stay contiguous. If every attempt fails, the original read error is what
 the client sees.
 
+If a server sends a complete `206 Partial Content` segment that ends before the
+end of the file, the next byte range is requested immediately. These requests
+do not use up the retries for dropped connections.
+
 A URL that expires in the middle of a track is not re-resolved by the continuation
 path, so that track fails. Playback fetches always send `Range: bytes=0-`; the
 probe used while loading deliberately does not.
 
-FFmpeg is watched as well: more than ten seconds without a complete frame is
-reported as a stall and cancels the decoder, which the player surfaces as a stuck
-track rather than silence.
+If playback startup or reading the next frame takes more than ten seconds, the
+player cancels the media request and decoder and emits `TrackStuckEvent`. This
+applies to both the in-process decoder and FFmpeg. The watchdog is idle while
+the player is waiting to unpause.

@@ -347,12 +347,36 @@ func (p *Player) startLocked() {
 }
 func (p *Player) run(ctx context.Context, gen uint64, t *protocol.Track, pos int64, volume int, filters protocol.Object, conn voice.Connection) {
 	defer p.wg.Done()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	// Use the same context for opening and reading the media, but arm the
+	// watchdog only while waiting on the engine, never while paused or pacing.
+	fired := make(chan struct{})
+	watchdog := time.AfterFunc(audio.StuckThreshold, func() {
+		cancel(audio.ErrStuck)
+		close(fired)
+	})
+	checkWatchdog := func(err error) error {
+		if !watchdog.Stop() {
+			// The callback may still be setting the cancellation cause.
+			<-fired
+		}
+		if errors.Is(context.Cause(ctx), audio.ErrStuck) {
+			return audio.ErrStuck
+		}
+		return err
+	}
 	frames, err := p.engine.Start(ctx, t, pos, volume, filters)
+	if frames != nil {
+		defer frames.Close()
+	}
+	err = checkWatchdog(err)
 	if err != nil {
-		p.finish(gen, err)
+		if ctx.Err() == nil || errors.Is(err, audio.ErrStuck) {
+			p.finish(gen, err)
+		}
 		return
 	}
-	defer frames.Close()
 	_, speed, _ := audio.Build(filters, volume)
 	position := float64(pos)
 	next := time.Now()
@@ -393,8 +417,13 @@ func (p *Player) run(ctx context.Context, gen uint64, t *protocol.Track, pos int
 				continue
 			}
 		}
+		watchdog.Reset(audio.StuckThreshold)
 		frame, e := frames.Next()
+		e = checkWatchdog(e)
 		if e != nil {
+			if ctx.Err() != nil && !errors.Is(e, audio.ErrStuck) {
+				return
+			}
 			if e == io.EOF {
 				e = nil
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -27,27 +28,23 @@ const (
 // ("wsarecv: An existing connection was forcibly closed by the remote host"),
 // which ended the track with reason=loadFailed.
 //
-// The bytes already read are always handed to the caller before a continuation
-// is arranged, so a failure at the very start of a track still fails fast.
+// Bytes already read are handed to the caller before a continuation is made.
+// A complete partial response is followed immediately by the next byte range.
 type resumableBody struct {
 	ctx      context.Context
+	cancel   context.CancelFunc
 	svc      *Service
 	raw      string
 	headers  map[string]string
-	body     io.ReadCloser
 	offset   int64
 	attempts int
 	pending  error
-	closed   bool
-	// size is the whole length of the media, or -1 when the source did not say.
-	// Seeking from the end needs it.
-	size int64
-}
 
-// newResumableBody wraps a playback body. The context must be the one that lives
-// for the whole playback, because a continuation is requested on it.
-func (s *Service) newResumableBody(ctx context.Context, raw string, headers map[string]string, body io.ReadCloser, size int64) io.ReadCloser {
-	return &resumableBody{ctx: ctx, svc: s, raw: raw, headers: headers, body: body, size: size}
+	// Only one goroutine reads or seeks, but FFmpeg can close the body while
+	// its stdin is reading or opening a new response.
+	mu     sync.Mutex
+	media  mediaResponse
+	closed bool
 }
 
 // Seek gives the body random access, which a container that keeps its header
@@ -67,11 +64,10 @@ func (r *resumableBody) Seek(offset int64, whence int) (int64, error) {
 	// A position at or past the end is not a range the source can serve: a
 	// request that starts at the end of the file is refused outright. Reads from
 	// there end the stream instead.
-	if r.size >= 0 && target >= r.size {
-		r.body.Close()
-		r.body = emptyBody{}
-		r.offset = target
-		r.pending = nil
+	if size := r.media.size; size >= 0 && target >= size {
+		if err := r.replace(mediaResponse{body: emptyBody{}, size: size, end: target}, target); err != nil {
+			return 0, err
+		}
 		return target, nil
 	}
 	if _, err := r.reopen(target); err != nil {
@@ -95,10 +91,10 @@ func (r *resumableBody) target(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		target = r.offset + offset
 	case io.SeekEnd:
-		if r.size < 0 {
+		if r.media.size < 0 {
 			return 0, errors.New("source did not report the length of the media")
 		}
-		target = r.size + offset
+		target = r.media.size + offset
 	default:
 		return 0, errors.New("invalid seek origin")
 	}
@@ -112,46 +108,87 @@ func (r *resumableBody) target(offset int64, whence int) (int64, error) {
 // the range. A source that ignores it restarts at zero, so the prefix is
 // discarded to leave the byte stream starting where the caller asked.
 func (r *resumableBody) reopen(target int64) (bool, error) {
-	body, honoured, err := r.svc.fetchStreamRange(r.ctx, r.raw, r.headers, target)
+	media, err := r.svc.fetchMedia(r.ctx, r.raw, r.headers, true, target)
 	if err != nil {
 		return false, err
 	}
-	if !honoured && target > 0 {
-		if _, derr := io.CopyN(io.Discard, body, target); derr != nil {
-			body.Close()
-			return honoured, derr
+	if size := r.media.size; size >= 0 {
+		if media.size >= 0 && media.size != size || media.end > size {
+			media.body.Close()
+			return media.partial, errors.New("media length changed between byte ranges")
+		}
+		media.size = size
+		if media.end < 0 {
+			media.end = size
 		}
 	}
-	r.body.Close()
-	r.body = body
+	if !media.partial && target > 0 {
+		if _, err := io.CopyN(io.Discard, media.body, target); err != nil {
+			media.body.Close()
+			return false, err
+		}
+	}
+	return media.partial, r.replace(media, target)
+}
+
+func (r *resumableBody) replace(media mediaResponse, target int64) error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		media.body.Close()
+		return io.ErrClosedPipe
+	}
+	old := r.media.body
+	r.media = media
+	r.mu.Unlock()
+	old.Close()
 	r.offset = target
 	r.pending = nil
-	return honoured, nil
+	return nil
 }
 
 func (r *resumableBody) Read(p []byte) (int, error) {
-	if r.pending != nil {
-		if err := r.resume(); err != nil {
-			return 0, err
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for {
+		if r.pending != nil {
+			if err := r.resume(); err != nil {
+				return 0, err
+			}
+		}
+		if r.media.end >= 0 && r.offset == r.media.end {
+			if !r.media.partial || r.offset == r.media.size {
+				return 0, io.EOF
+			}
+			// The server sent a complete segment, not a broken connection.
+			// Request the next segment without spending the retry budget.
+			if _, err := r.reopen(r.offset); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		buf := p
+		if remaining := r.media.end - r.offset; r.media.end >= 0 && remaining < int64(len(buf)) {
+			buf = buf[:remaining]
+		}
+		n, err := r.media.body.Read(buf)
+		r.offset += int64(n)
+		if err == nil || r.offset == r.media.end {
+			return n, nil
+		}
+		if errors.Is(err, io.EOF) {
+			if r.media.end < 0 {
+				return n, io.EOF
+			}
+			err = io.ErrUnexpectedEOF
+		}
+		r.pending = err
+		if n > 0 {
+			// Hand over what arrived and arrange the recovery on the next call.
+			return n, nil
 		}
 	}
-	n, err := r.body.Read(p)
-	r.offset += int64(n)
-	if err == nil || errors.Is(err, io.EOF) {
-		return n, err
-	}
-	if n > 0 {
-		// Hand over what arrived and arrange the continuation on the next call.
-		r.pending = err
-		return n, nil
-	}
-	// The error is recorded even when no byte arrived, because resume reports it
-	// when every attempt fails; leaving it unset here would loop forever.
-	r.pending = err
-	if rerr := r.resume(); rerr != nil {
-		return 0, rerr
-	}
-	return r.Read(p)
 }
 
 // resume requests the rest of the media, starting at the current offset. Another
@@ -196,9 +233,14 @@ func (r *resumableBody) resume() error {
 }
 
 func (r *resumableBody) Close() error {
+	r.mu.Lock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil
 	}
 	r.closed = true
-	return r.body.Close()
+	body := r.media.body
+	r.mu.Unlock()
+	r.cancel()
+	return body.Close()
 }

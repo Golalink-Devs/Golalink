@@ -34,6 +34,10 @@ const maxHeader = 16 << 20
 // cannot ask for an unbounded allocation.
 const maxSamples = 16 << 20
 
+// An AAC access unit is far smaller than this. Bound the untrusted size
+// before converting it to int or allocating memory for the sample.
+const maxAACSampleSize = 64 << 10
+
 // mp4Audio reads the audio track of a progressive MP4 that has already been
 // positioned at the first byte of its media data.
 type mp4Audio struct {
@@ -59,6 +63,10 @@ func (m *mp4Audio) sample() ([]byte, error) {
 	if m.next >= len(m.sizes) {
 		return nil, io.EOF
 	}
+	rawSize := m.sizes[m.next]
+	if rawSize > maxAACSampleSize {
+		return nil, fmt.Errorf("pure: mp4 AAC sample %d is too large (%d bytes)", m.next, rawSize)
+	}
 	target := m.offsets[m.next]
 	if target < m.consumed {
 		// The media is not laid out in file order, which this forward reader
@@ -72,7 +80,7 @@ func (m *mp4Audio) sample() ([]byte, error) {
 			return nil, err
 		}
 	}
-	size := int(m.sizes[m.next])
+	size := int(rawSize)
 	au := make([]byte, size)
 	if _, err := io.ReadFull(m.r, au); err != nil {
 		return nil, err

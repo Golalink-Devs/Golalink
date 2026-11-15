@@ -316,19 +316,18 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) *session {
 	s.mu.Lock()
 	v := s.sessions[r.PathValue("sessionId")]
 	s.mu.Unlock()
-	if v == nil || v.resumableOnly() {
+	if v == nil || !v.attached() {
 		s.fail(w, r, 404, "session not found")
 		return nil
 	}
 	return v
 }
 
-// resumableOnly reports whether the session is waiting to be resumed, which
-// upstream does not expose over REST.
-func (v *session) resumableOnly() bool {
+// A pending upgrade or a disconnected session is hidden from REST.
+func (v *session) attached() bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return !v.connected && v.resuming && !v.closed
+	return v.connected && !v.closed
 }
 func (s *Server) loadTracks(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("identifier")
@@ -503,6 +502,11 @@ func (s *Server) updateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v.mu.Lock()
+	if !v.connected || v.closed {
+		v.mu.Unlock()
+		s.fail(w, r, 404, "session not found")
+		return
+	}
 	if update.Resuming != nil {
 		v.resuming = *update.Resuming
 	}
@@ -537,13 +541,16 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 				s.fail(w, r, 403, "session belongs to another bot")
 				return
 			}
-			if v.connected {
+			if v.connected || v.attaching {
 				v.mu.Unlock()
 				s.mu.Unlock()
 				s.fail(w, r, 409, "session already connected")
 				return
 			}
 			resumed = v.resuming && !v.closed && time.Since(v.disconnected) < time.Duration(v.timeout)*time.Second
+			if resumed {
+				v.attaching = true
+			}
 			v.mu.Unlock()
 			if !resumed {
 				v = nil
@@ -563,18 +570,11 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := hex.EncodeToString(b[:])
-		v = &session{id: id, user: user, timeout: 60, players: map[string]*player.Player{}, events: make(chan []byte, s.config.EventBuffer), done: make(chan struct{}), server: s}
+		v = &session{id: id, user: user, timeout: 60, attaching: true, players: map[string]*player.Player{}, events: make(chan []byte, s.config.EventBuffer), done: make(chan struct{}), server: s}
 		s.sessions[id] = v
 	}
-	v.mu.Lock()
-	v.connected = true
-	v.mu.Unlock()
+	sessionCount := len(s.sessions)
 	s.mu.Unlock()
-	if resumed {
-		s.deps.Logger.Info("session resumed", "sessionId", v.id, "userId", user, "players", len(v.players))
-	} else {
-		s.deps.Logger.Info("session created", "sessionId", v.id, "userId", user, "client", r.Header.Get("Client-Name"), "sessions", len(s.sessions))
-	}
 	upgrader := websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, HandshakeTimeout: 10 * time.Second}
 	// Lavalink answers the handshake with the API version, the session id and
 	// whether the session was resumed.
@@ -585,19 +585,34 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 	}
 	c, e := upgrader.Upgrade(w, r, headers)
 	if e != nil {
+		if resumed {
+			// A failed handshake never attached. Keep the original resume deadline.
+			v.mu.Lock()
+			v.attaching = false
+			v.mu.Unlock()
+		} else {
+			s.remove(v.id)
+		}
 		s.deps.Logger.Warn("websocket upgrade failed", "sessionId", v.id, "error", e)
-		s.detach(v, nil)
 		return
 	}
 	v.mu.Lock()
+	v.attaching = false
 	if v.closed {
 		v.mu.Unlock()
 		c.Close()
 		return
 	}
 	v.conn = c
+	v.connected = true
+	playerCount := len(v.players)
 	v.mu.Unlock()
 	defer func() { c.Close(); s.detach(v, c) }()
+	if resumed {
+		s.deps.Logger.Info("session resumed", "sessionId", v.id, "userId", user, "players", playerCount)
+	} else {
+		s.deps.Logger.Info("session created", "sessionId", v.id, "userId", user, "client", r.Header.Get("Client-Name"), "sessions", sessionCount)
+	}
 	c.SetReadLimit(4096)
 	_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.SetPongHandler(func(string) error { return c.SetReadDeadline(time.Now().Add(60 * time.Second)) })
@@ -620,20 +635,21 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) detach(v *session, c *websocket.Conn) {
 	v.mu.Lock()
-	if v.closed || (c != nil && v.conn != c) {
+	if v.closed || v.conn != c {
 		v.mu.Unlock()
 		return
 	}
 	v.conn = nil
 	v.connected = false
 	v.disconnected = time.Now()
-	keep := v.resuming && v.timeout > 0
+	timeout := v.timeout
+	keep := v.resuming && timeout > 0
 	players := len(v.players)
 	v.mu.Unlock()
 	if keep {
 		s.deps.Logger.Info("session disconnected, awaiting resume",
 			"sessionId", v.id,
-			"timeoutSeconds", v.timeout,
+			"timeoutSeconds", timeout,
 			"players", players,
 		)
 		return
@@ -669,7 +685,7 @@ func (s *Server) reap() {
 			var expired []*session
 			for id, v := range s.sessions {
 				v.mu.Lock()
-				stale := !v.connected && (!v.resuming || time.Since(v.disconnected) >= time.Duration(v.timeout)*time.Second)
+				stale := !v.attaching && !v.connected && (!v.resuming || time.Since(v.disconnected) >= time.Duration(v.timeout)*time.Second)
 				if stale {
 					delete(s.sessions, id)
 					expired = append(expired, v)
@@ -678,12 +694,15 @@ func (s *Server) reap() {
 			}
 			s.mu.Unlock()
 			for _, v := range expired {
+				v.mu.Lock()
+				resumable, timeout, players := v.resuming, v.timeout, len(v.players)
+				v.mu.Unlock()
 				s.deps.Logger.Info("session expired",
 					"sessionId", v.id,
 					"userId", v.user,
-					"resumable", v.resuming,
-					"timeoutSeconds", v.timeout,
-					"players", len(v.players),
+					"resumable", resumable,
+					"timeoutSeconds", timeout,
+					"players", players,
 				)
 				v.destroy()
 			}

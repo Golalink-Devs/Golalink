@@ -18,6 +18,7 @@ type session struct {
 	players           map[string]*player.Player
 	resuming          bool
 	timeout           int
+	attaching         bool // an upgrade in progress, reserved before releasing the server lock
 	connected, closed bool
 	disconnected      time.Time
 	conn              *websocket.Conn

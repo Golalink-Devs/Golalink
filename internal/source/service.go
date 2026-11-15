@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -295,39 +296,26 @@ func retryableMedia(err error) bool {
 // fetch returns the body and the total length the server declared, which is -1
 // when it did not. The length refines the duration of a few formats.
 func (s *Service) fetch(ctx context.Context, raw string, headers map[string]string) (io.ReadCloser, int64, error) {
-	return s.fetchWith(ctx, raw, headers, false)
+	media, err := s.fetchMedia(ctx, raw, headers, false, 0)
+	return media.body, media.size, err
 }
 
-// fetchStream requests a body for playback. It sends a byte range because the
-// CDNs behind YouTube answer a plain GET with a rejection or a truncated body,
-// while a range request reliably returns the media (and a clean status when it
-// refuses). Redirects are still never followed: every hop has to pass the
-// network guard again.
-func (s *Service) fetchStream(ctx context.Context, raw string, headers map[string]string) (io.ReadCloser, error) {
-	body, _, err := s.fetchWith(ctx, raw, headers, true)
-	return body, err
+type mediaResponse struct {
+	body    io.ReadCloser
+	size    int64 // total length, or -1 if unknown
+	end     int64 // absolute end of this response, exclusive; -1 if unknown
+	partial bool
 }
 
-func (s *Service) fetchWith(ctx context.Context, raw string, headers map[string]string, ranged bool) (io.ReadCloser, int64, error) {
-	body, _, size, err := s.fetchStatus(ctx, raw, headers, ranged, 0)
-	return body, size, err
-}
-
-// fetchStreamRange continues a playback body from offset. It reports whether the
-// source honoured the range, because a source that ignores it restarts the body
-// at zero and the caller then has to discard the prefix.
-func (s *Service) fetchStreamRange(ctx context.Context, raw string, headers map[string]string, offset int64) (io.ReadCloser, bool, error) {
-	body, ranged, _, err := s.fetchStatus(ctx, raw, headers, true, offset)
-	return body, ranged, err
-}
-
-func (s *Service) fetchStatus(ctx context.Context, raw string, headers map[string]string, ranged bool, offset int64) (io.ReadCloser, bool, int64, error) {
+// Playback requests a byte range because some CDNs reject plain GETs. A 200
+// response ignores the requested offset; the caller can discard the prefix.
+func (s *Service) fetchMedia(ctx context.Context, raw string, headers map[string]string, ranged bool, offset int64) (mediaResponse, error) {
 	if err := netguard.ValidateURL(raw); err != nil {
-		return nil, false, 0, err
+		return mediaResponse{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return nil, false, 0, err
+		return mediaResponse{}, err
 	}
 	req.Header.Set("User-Agent", "Golalink/0.1")
 	for k, v := range headers {
@@ -335,47 +323,57 @@ func (s *Service) fetchStatus(ctx context.Context, raw string, headers map[strin
 			req.Header.Set(k, v)
 		}
 	}
-	if ranged && req.Header.Get("Range") == "" {
-		if offset > 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-		} else {
-			req.Header.Set("Range", "bytes=0-")
-		}
+	if ranged {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 	r, err := s.HTTP.Do(req)
 	if err != nil {
-		return nil, false, 0, err
+		return mediaResponse{}, err
 	}
+	contentRange := r.Header.Get("Content-Range")
 	if r.StatusCode < 200 || r.StatusCode >= 300 {
 		r.Body.Close()
-		return nil, false, 0, &mediaError{Status: r.StatusCode}
-	}
-	partial := r.StatusCode == http.StatusPartialContent
-	size := int64(-1)
-	// A partial response describes the whole file, not the slice it returned.
-	if length := r.ContentLength; length >= 0 && (!partial || r.Header.Get("Content-Range") != "") {
-		size = length
-		if partial {
-			if total, ok := totalFromContentRange(r.Header.Get("Content-Range")); ok {
-				size = total
+		// When earlier ranges did not report a total, a 416 at exactly the
+		// reported length is how the server signals the end of the file.
+		if ranged && offset > 0 && r.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			unit, value, _ := strings.Cut(contentRange, " ")
+			if total, ok := strings.CutPrefix(value, "*/"); strings.EqualFold(unit, "bytes") && ok {
+				if size, err := strconv.ParseInt(total, 10, 64); err == nil && size == offset {
+					return mediaResponse{body: emptyBody{}, size: size, end: size, partial: true}, nil
+				}
 			}
 		}
+		return mediaResponse{}, &mediaError{Status: r.StatusCode}
 	}
-	return r.Body, partial, size, nil
+	if r.StatusCode != http.StatusPartialContent {
+		return mediaResponse{body: r.Body, size: r.ContentLength, end: r.ContentLength}, nil
+	}
+	start, end, size, err := parseMediaRange(contentRange)
+	if err != nil || start != offset || (r.ContentLength >= 0 && r.ContentLength != end-start) {
+		r.Body.Close()
+		return mediaResponse{}, fmt.Errorf("invalid Content-Range %q for media offset %d", contentRange, offset)
+	}
+	return mediaResponse{body: r.Body, size: size, end: end, partial: true}, nil
 }
 
-// totalFromContentRange reads the complete length out of a "bytes 0-99/1234"
-// header, which is the only place a ranged response states it.
-func totalFromContentRange(value string) (int64, bool) {
-	slash := strings.LastIndexByte(value, '/')
-	if slash < 0 {
-		return 0, false
+func parseMediaRange(value string) (start, end, size int64, err error) {
+	unit, rest, _ := strings.Cut(value, " ")
+	span, total, _ := strings.Cut(rest, "/")
+	first, last, _ := strings.Cut(span, "-")
+	lo, loErr := strconv.ParseInt(first, 10, 64)
+	hi, hiErr := strconv.ParseInt(last, 10, 64)
+	if !strings.EqualFold(unit, "bytes") || loErr != nil || hiErr != nil || lo < 0 || hi < lo || hi == math.MaxInt64 {
+		return 0, 0, 0, errors.New("invalid media byte range")
 	}
-	total, err := strconv.ParseInt(strings.TrimSpace(value[slash+1:]), 10, 64)
-	if err != nil || total <= 0 {
-		return 0, false
+	size = -1
+	if total != "*" {
+		size, err = strconv.ParseInt(total, 10, 64)
+		if err != nil || size <= hi {
+			return 0, 0, 0, errors.New("invalid media length")
+		}
 	}
-	return total, true
+	return lo, hi + 1, size, nil
 }
 func (s *Service) loadHTTP(ctx context.Context, id string) (protocol.LoadResult, error) {
 	body, size, err := s.fetch(ctx, id, nil)
@@ -537,9 +535,11 @@ func (s *Service) openMedia(ctx context.Context, work context.Context, resolve f
 // order. The length is part of that: a seek from the end is how a container with
 // its header in the tail is reached.
 func (s *Service) openSeekable(ctx context.Context, raw string, headers map[string]string) (io.ReadCloser, error) {
-	body, size, err := s.fetchWith(ctx, raw, headers, true)
+	ctx, cancel := context.WithCancel(ctx)
+	media, err := s.fetchMedia(ctx, raw, headers, true, 0)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	return s.newResumableBody(ctx, raw, headers, body, size), nil
+	return &resumableBody{ctx: ctx, cancel: cancel, svc: s, raw: raw, headers: headers, media: media}, nil
 }
