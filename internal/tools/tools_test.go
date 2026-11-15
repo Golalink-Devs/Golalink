@@ -128,11 +128,14 @@ func TestExtractTakesTheMemberByBaseName(t *testing.T) {
 		{"ffmpeg-master-latest-win64-gpl/bin/ffmpeg", "posix bytes"},
 	})
 
-	for _, tc := range []struct{ member, want string }{
-		{"ffmpeg.exe", "encoder bytes"},
-		{"ffmpeg", "posix bytes"},
+	for _, tc := range []struct {
+		member string
+		want   string
+	}{
+		{member: "ffmpeg.exe", want: "encoder bytes"},
+		{member: "ffmpeg", want: "posix bytes"},
 	} {
-		t.Run("extract "+tc.member, func(t *testing.T) {
+		t.Run("the member is copied out/"+tc.member, func(t *testing.T) {
 			target := filepath.Join(t.TempDir(), tc.member)
 			if err := extract(archive, tc.member, target); err != nil {
 				t.Fatalf("extract: %v", err)
