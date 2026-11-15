@@ -304,6 +304,47 @@ func TestRateLimitRefusesABurst(t *testing.T) {
 	})
 }
 
+func TestRateLimitOnlyCountsAuthenticatedRequests(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		name := "enabled"
+		if !enabled {
+			name = "disabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := newTestServer(t, func(c *config.Config) { c.RateLimits.Enable = enabled })
+			checkUnauthorized := func() {
+				t.Helper()
+				for i := 0; i < 10; i++ {
+					for _, password := range []string{"", "not-the-password"} {
+						rec := do(srv, http.MethodGet, "/v4/info", password)
+						if rec.Code != http.StatusUnauthorized {
+							t.Fatalf("unauthenticated request %d: status = %d, want 401", i+1, rec.Code)
+						}
+						if body := decodeError(t, rec); body.Message != "invalid authorization" {
+							t.Fatalf("message = %q, want invalid authorization", body.Message)
+						}
+					}
+				}
+			}
+
+			checkUnauthorized()
+			for i := 0; i < 5; i++ {
+				if rec := do(srv, http.MethodGet, "/v4/info", "secret"); rec.Code != http.StatusOK {
+					t.Fatalf("authenticated request %d: status = %d, want 200 within the burst", i+1, rec.Code)
+				}
+			}
+			want := http.StatusOK
+			if enabled {
+				want = http.StatusTooManyRequests
+			}
+			if rec := do(srv, http.MethodGet, "/v4/info", "secret"); rec.Code != want {
+				t.Fatalf("authenticated request after burst: status = %d, want %d", rec.Code, want)
+			}
+			checkUnauthorized()
+		})
+	}
+}
+
 // TestMetricsArePrometheusText covers the scrape endpoint: an operator's
 // dashboard breaks on a malformed exposition rather than on a status code.
 func TestMetricsArePrometheusText(t *testing.T) {

@@ -315,10 +315,8 @@ growing without bound.
 | `ratelimits.enable` | `true` | Apply the per-route request limits |
 
 Each route has its own token bucket and answers with `429` once it is exhausted.
-The limiter runs before the password check, so a request rejected for a bad
-password spends a token and is throttled like any other.
 
-Turning this off removes the throttling and serves every request.
+Turning this off removes the throttling; protected routes still require the password.
 
 ## Webhook
 

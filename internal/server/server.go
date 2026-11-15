@@ -137,9 +137,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 // authorize rejects a request whose Authorization header does not carry the
-// node password. It runs inside a route, after the rate limiter, so a throttled
-// request is refused before authentication and a rejected one still spends a
-// token.
+// node password. It runs before the route's rate limiter so rejected credentials
+// cannot spend the tokens shared by authenticated clients.
 func (s *Server) authorize(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(s.config.Password)) != 1 {
@@ -194,12 +193,11 @@ func (s *Server) routes() {
 	deny := func(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, http.StatusTooManyRequests, "too many requests")
 	}
-	// protected wraps a route with the rate limiter and then the password
-	// check, so the limiter counts every request, including the ones the
-	// check rejects. public is the same without the password check.
+	// protected checks the password before applying the route's rate limiter.
+	// public applies only the limiter, since it has no password check.
 	protected := func(handler http.HandlerFunc, r rate.Limit, burst int) http.Handler {
 		if s.config.RateLimits.Enable {
-			return middleware.RateLimitMiddleware(r, burst, deny)(s.authorize(handler))
+			return s.authorize(middleware.RateLimitMiddleware(r, burst, deny)(handler))
 		}
 		return s.authorize(handler)
 	}
