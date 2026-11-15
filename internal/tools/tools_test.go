@@ -128,24 +128,27 @@ func TestExtractTakesTheMemberByBaseName(t *testing.T) {
 		{"ffmpeg-master-latest-win64-gpl/bin/ffmpeg", "posix bytes"},
 	})
 
-	t.Run("the member is copied out", func(t *testing.T) {
-		target := filepath.Join(t.TempDir(), executableName("ffmpeg"))
-		if err := extract(archive, executableName("ffmpeg"), target); err != nil {
-			t.Fatalf("extract: %v", err)
-		}
-		got, err := os.ReadFile(target)
-		if err != nil {
-			t.Fatalf("reading the extracted file: %v", err)
-		}
-		if want := "encoder bytes"; string(got) != want {
-			t.Fatalf("extracted %q, want %q", got, want)
-		}
-		// The copy goes through a temporary file, which must not be left behind
-		// next to the helper.
-		if _, err := os.Stat(target + ".part"); !os.IsNotExist(err) {
-			t.Fatalf("a partially written file was left behind: %v", err)
-		}
-	})
+	for _, tc := range []struct{ member, want string }{
+		{"ffmpeg.exe", "encoder bytes"},
+		{"ffmpeg", "posix bytes"},
+	} {
+		t.Run("extract "+tc.member, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), tc.member)
+			if err := extract(archive, tc.member, target); err != nil {
+				t.Fatalf("extract: %v", err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("reading the extracted file: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("extracted %q, want %q", got, tc.want)
+			}
+			if _, err := os.Stat(target + ".part"); !os.IsNotExist(err) {
+				t.Fatalf("a partially written file was left behind: %v", err)
+			}
+		})
+	}
 
 	t.Run("a member the archive does not hold is reported", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "missing")
